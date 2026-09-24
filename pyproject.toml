@@ -1,0 +1,22 @@
+[project]
+name = "qwen-image-server"
+version = "0.1.0"
+description = "Qwen-Image-2.1 HTTP job server (GGUF or original weights) for a 24 GB GPU"
+requires-python = ">=3.12,<3.14"
+dependencies = [
+    "torch>=2.4.0",
+    "torchvision",
+    "diffusers @ git+https://github.com/huggingface/diffusers",
+    "transformers>=5.17",
+    "accelerate",
+    "gguf>=0.10.0",
+    "bitsandbytes",
+    "safetensors",
+    "huggingface_hub",
+    "pillow",
+    "fastapi",
+    "uvicorn",
+]
+
+[tool.uv]
+package = false

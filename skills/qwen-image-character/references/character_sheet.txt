@@ -1,0 +1,60 @@
+[Task]
+Generate a high-precision character sheet based on the reference image while locking the character ID. Generating a new character is strict prohibited; all panels must be based on the exact same character structure.
+The character is {subject}.
+{reference_note}
+
+[Basic Settings]
+* Style: {style}
+* Character Description: {description}
+* Gender: {gender}
+* Age: {age}
+* Body Type: {body_type}
+* Style Keywords: {style_keywords}
+
+[Canvas Composition]
+* Aspect Ratio: 4:3 (Landscape)
+* Background: Solid White / Off-white / Minimalist
+* UI: Clean technical layout, no logos, no watermarks
+* Typography: Clear, legible English labels
+
+[Required Modules]
+1. Top Information Header
+   * Name{name}
+   * Character Role / Identity{role}
+   * Age: {age}
+   * Personality Keywords (3–5 words){personality}
+   * Core Theme (1 sentence){theme}
+2. Color Palette System — 6 to 8 color swatches (no text)
+3. Main Identity Display (Largest Region) — Focus: Lock character identity
+   * Front / 3/4 View / Side / Back
+   * Standard T-pose or A-pose standing stance
+   * Height scale / proportion lines included
+   * No props
+4. Silhouette Breakdown
+   * Front silhouette
+   * Side silhouette
+5. Facial Expression Matrix (8 Views)
+   * Neutral / Curious / Tense / Surprised / Scared / Sad / Determined / Relaxed
+6. Micro-Expressions (5 Views)
+   * Eye tension / Subtle smile / Clenched jaw / Faint fear / Controlled breathing
+7. Head Structure Breakdown
+   * Multi-angle views (3/4, Profile, Low-angle/Upward, High-angle/Downward)
+8. Pose Variations
+   * Relaxed / Tense / Confident
+9. Close-Up Shot (1 View)
+   * Bust shot (chest up)
+   * Strong emotional expression
+10. Outfit & Material Details (4 Views)
+   * Hairstyle / Fabric texture / Accessories / Footwear
+11. Hand Gestures
+   * Relaxed / Clenched or tense / Pointing / Gripping / Facial touch
+
+[Consistency Requirements]
+* Complete character consistency across all panels (face, hair, proportions, outfit)
+* Zero style drift
+* The Main Identity Display region must occupy the largest area
+
+[Quality Requirements]
+* 8K-level production detail
+* Photorealistic materials (skin texture, cloth weave, metallic surfaces)
+* Cinematic lighting and shading
