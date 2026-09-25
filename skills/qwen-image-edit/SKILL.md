@@ -52,8 +52,14 @@ script uploads them.
   across panels. Use the template's grid rules for the ratio: three standing figures in a row is `1:1`, not `3:1`.
 - **Preserve by naming, not describing:** "keep her face, pose and the street unchanged" works better than
   re-describing them. Detailed descriptions of kept content make the model regenerate it.
-- **Memory:** edits keep the text encoder loaded. One input image at 2K peaks around 22 GiB of 24. Many large inputs
-  may fail with a CUDA out-of-memory error; the job then reports `failed` with that message. Retry with fewer
-  inputs or a smaller output ratio, or ask the user to restart the server with `--cpu-offload`.
+- **How many images actually fit:** each 2K input costs about 2.6 GiB of VRAM on top of the resident weights, so
+  the `1-10` the API accepts is not what a given GPU can do. `QI health` reports `max_edit_images_2k` for that
+  server; on a 32 GB card with the default weights it is 4. Sending more is rejected at submit time with a `422`
+  saying how many fit, so check `health` before composing an edit with several inputs rather than discovering it
+  after the wait. Changing the ratio does not help: every size is about the same pixel count. Fewer inputs, or
+  ask the user to restart the server with `--cpu-offload`.
 - **Output size:** `ratio_follow` keeps the input's aspect ratio at a 2K-level size; `wh_ratio` takes any `W:H`.
-- **Timing:** about 7 s per step (a 40-step edit takes about 4–5 minutes), plus any jobs queued ahead.
+- **Timing:** depends on the GPU, so do not quote a fixed figure. `QI health` reports the server's measured
+  `sec_per_step`, and each submit returns `eta_s` for that job including anything queued ahead. Use those.
+  Health also reports `eta_source`: `prior` means no job has been measured on this server yet, so treat the first
+  `eta_s` as rough and re-read it from status after a few steps.

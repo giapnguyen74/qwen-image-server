@@ -220,3 +220,5 @@ __marimo__/
 # Generated images
 outputs/
 qwen_images/
+qwen_image_profile.json
+qwen_image_timing.json

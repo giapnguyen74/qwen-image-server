@@ -54,8 +54,11 @@ steps and seed. `QI cancel <id>` stops a job, and `QI list` shows all jobs.
 - **Everything in the prompt gets drawn:** requirement lists and section headings can appear as panels, so the
   prompt should only describe what is visible, which is what the rewriting template does.
 - **Known artifact:** faint purple vertical specks sometimes appear; more steps do not remove them.
-- **Timing:** about 6–7 s per step on the RTX 3090 (a 40-step 2K image takes about 4–5 minutes), plus any jobs
-  queued ahead.
+- **Timing:** depends on the GPU, so do not quote a fixed figure. `QI health` reports the server's measured
+  `sec_per_step`, and every submit returns `eta_s` for that job including anything queued ahead. Use those.
+  Health also reports `eta_source`: `prior` means no job has been measured on this server yet, so treat the first
+  `eta_s` as rough and re-read it from status after a few steps. For reference, a 40-step 2K image is about 4–5
+  minutes on an RTX 3090 and about 1.5 minutes on an RTX 5090.
 
 ## Sizes
 

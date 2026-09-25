@@ -58,7 +58,8 @@ QI t2i --ratio 4:3 < sheet_prompt.txt                             # without
 ```
 
 The reply has the job `id`, queue `position`, and `eta_s`, the estimated seconds until it is ready; a sheet takes
-about 4–5 minutes plus any queue. Then run `QI wait <id>` (polls up to 100 s) again until `status` is `done`;
+as long as any other 2K render on that GPU (`eta_s` is the estimate to use, not a fixed figure). Then run
+`QI wait <id>` (polls up to 100 s) again until `status` is `done`;
 `saved_to` has the PNG path. Pass `--seed N` when the user wants to iterate on settings while keeping the same
 composition, and reuse it on every rerun.
 

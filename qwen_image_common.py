@@ -14,6 +14,7 @@ Nothing is downloaded: every file is resolved with local_files_only=True. Run ./
 """
 
 import os
+import shutil
 import tempfile
 import time
 from pathlib import Path
@@ -31,9 +32,92 @@ QUANTS = ["BF16", "Q8_0", "Q6_K", "Q5_K_M", "Q4_K_M", "Q4_0"]      # --weights g
 ORIGINAL_QUANTS = ["8bit", "4bit", "bf16"]                         # --weights original (bitsandbytes)
 TE_QUANTS = ["8bit", "4bit", "none"]
 
+# Peak VRAM of a full-frame (untiled) VAE decode, per megapixel of output. Measured on an RTX 5090
+# with this bf16 VAE: 6.56 GiB at 1024x1024, 14.76 at 1536x1536, 25.32 at 2752x1536, and out of
+# memory at 2048x2048 with nothing but the VAE loaded. Tiled decode costs 0.43-0.47 GiB at every
+# one of those sizes. So the model card's 2K sizes never decode full-frame, on any card sold today;
+# only smaller outputs can, which is what set_vae_tiling() checks for.
+VAE_DECODE_GIB_PER_MPX = 6.26
+VAE_DECODE_HEADROOM = 1.25         # margin for fragmentation and anything else sharing the card
+
+# Weights that stay resident on the GPU, GiB. The GGUF quants are their size on disk; Q8_0 was
+# measured at 7.07 GiB allocated, matching. The original entries are bitsandbytes' quantized sizes.
+RESIDENT_GIB = {
+    ("gguf", "BF16"): 14.0, ("gguf", "Q8_0"): 7.1, ("gguf", "Q6_K"): 5.5,
+    ("gguf", "Q5_K_M"): 4.9, ("gguf", "Q4_K_M"): 4.3, ("gguf", "Q4_0"): 3.9,
+    ("original", "bf16"): 13.3, ("original", "8bit"): 7.5, ("original", "4bit"): 4.5,
+}
+# 8bit measured at 9.34 GiB allocated (16.41 total with a 7.07 GiB transformer), not the 8.5 the
+# file size suggests: bitsandbytes keeps fp16 outlier columns alongside the int8 weights.
+TE_RESIDENT_GIB = {"8bit": 9.3, "4bit": 5.0, "none": 17.5}
+VAE_RESIDENT_GIB = 0.62            # measured
+
+# VRAM needed on top of the resident weights while a job runs, measured at 2048x2048 with GGUF
+# Q8_0 + an 8-bit text encoder: 2.31 GiB for text-to-image, then about 2.59 GiB per 2K input image
+# (1 -> 4.89, 2 -> 7.48, 4 -> 12.65 GiB; 8 ran out of memory on a 31.4 GiB card). Peak does not
+# depend on step count. Scaled by output area, since these were taken at the 2048x2048 pixel count.
+WORKING_SET_BASE_GIB = 2.31
+WORKING_SET_PER_IMAGE_GIB = 2.59
+MEASURED_MPX = 2048 * 2048 / 1e6
+
+
+def working_set_gib(width, height, n_images):
+    """Estimated VRAM a job needs beyond the resident weights."""
+    scale = (width * height / 1e6) / MEASURED_MPX
+    return (WORKING_SET_BASE_GIB + WORKING_SET_PER_IMAGE_GIB * n_images) * scale
+
+# Written by setup.sh next to this file, read by the server and the dry run so that whatever
+# setup.sh downloaded is what gets loaded. Command line flags still win over it.
+PROFILE_PATH = Path(__file__).resolve().parent / "qwen_image_profile.json"
+PROFILE_FIELDS = ("weights", "quant", "te_quant", "cpu_offload")
+
 
 def gib(n_bytes):
     return f"{n_bytes / 2**30:.2f} GiB"
+
+
+def vram_budget():
+    """(free, total) GiB on the current CUDA device.
+
+    Free rather than total: another process may already hold part of the card, so the amount
+    actually available is what the defaults should be chosen against.
+    """
+    free, total = torch.cuda.mem_get_info()
+    return free / 2**30, total / 2**30
+
+
+def untiled_decode_fits(width, height, free_gib):
+    """Whether a full-frame VAE decode at this size fits in the VRAM free right now.
+
+    Returns (fits, GiB needed); (False, None) when the decode cost has not been measured, so an
+    unmeasured build keeps the conservative tiled path rather than guessing.
+    """
+    if VAE_DECODE_GIB_PER_MPX is None:
+        return False, None
+    need = VAE_DECODE_GIB_PER_MPX * (width * height / 1e6) * VAE_DECODE_HEADROOM
+    return need < free_gib, need
+
+
+def set_vae_tiling(pipe, width, height, cpu_offload=False):
+    """Tile the VAE decode only when a full-frame decode would not fit.
+
+    The 24 GB card this project was written for never had the room at 2K, so tiling used to be
+    unconditional. On a larger card a full-frame decode is faster and leaves no tile seams.
+    """
+    if cpu_offload:   # offload exists to save VRAM; don't spend it back on the decode
+        pipe.vae.enable_tiling()
+        return
+    free_gib, _ = vram_budget()
+    fits, need = untiled_decode_fits(width, height, free_gib)
+    if fits:
+        pipe.vae.disable_tiling()
+        print(f"  vae: full-frame decode ({need:.1f} GiB needed, {free_gib:.1f} GiB free)")
+    elif need is None:
+        pipe.vae.enable_tiling()
+        print(f"  vae: tiled decode (full-frame cost not measured on this build)")
+    else:
+        pipe.vae.enable_tiling()
+        print(f"  vae: tiled decode ({need:.1f} GiB needed for full-frame, {free_gib:.1f} GiB free)")
 
 
 def vram(label):
@@ -81,20 +165,46 @@ def bnb_config(quant, lib):
     return None
 
 
-def resolve_quant(weights, quant, cpu_offload=False):
-    """Default and validate the transformer quant for the chosen weight set."""
+def resolve_quant(weights, quant, cpu_offload=False, te_quant=None):
+    """Default and validate the transformer quant for the chosen weight set.
+
+    Warnings are measured against the VRAM actually free on this card rather than against the
+    24 GB the project was originally written for.
+    """
     choices = QUANTS if weights == "gguf" else ORIGINAL_QUANTS
     if quant is None:
-        return "Q8_0" if weights == "gguf" else "8bit"
-    if quant not in choices:
+        quant = "Q8_0" if weights == "gguf" else "8bit"
+    elif quant not in choices:
         raise SystemExit(f"--quant {quant} is not valid with --weights {weights}; choose from {', '.join(choices)}")
-    if weights == "original" and quant == "bf16" and not cpu_offload:
-        print("warning: the bf16 original transformer is 13.3 GiB; with the text encoder kept loaded it will "
-              "likely run out of VRAM on 24 GB. Consider --cpu-offload or --quant 8bit")
     if weights == "original" and quant == "8bit" and cpu_offload:
         print("warning: an 8-bit transformer does not offload (bitsandbytes keeps its int8 weights on the GPU); "
               "use 4bit or bf16 with --cpu-offload")
+    if not cpu_offload:
+        warn_if_tight(weights, quant, te_quant or "8bit")
     return quant
+
+
+def warn_if_tight(weights, quant, te_quant):
+    """Warn when the resident weights leave too little of this card for the denoising pass."""
+    free_gib = gpu_free_gib()
+    if free_gib is None:                     # no CUDA yet: nothing to measure against
+        return
+    resident = (RESIDENT_GIB.get((weights, quant), 0) + TE_RESIDENT_GIB.get(te_quant, 0)
+                + VAE_RESIDENT_GIB)
+    if resident > free_gib * 0.85:
+        print(f"warning: {weights}/{quant} plus a {te_quant} text encoder is about {resident:.1f} GiB "
+              f"resident, and only {free_gib:.1f} GiB is free on this GPU. Expect out-of-memory at 2K; "
+              f"consider --cpu-offload, a smaller --quant, or --te-quant 4bit")
+
+
+def gpu_free_gib():
+    """Free VRAM in GiB, or None when there is no usable CUDA device."""
+    try:
+        if not torch.cuda.is_available():
+            return None
+        return vram_budget()[0]
+    except (RuntimeError, AssertionError):
+        return None
 
 
 def load_original_transformer(quant, official_dir):
@@ -181,19 +291,23 @@ def load_text_encoder(te_quant, official_dir, device="cuda", weights="gguf"):
     # from_pretrained wants a model directory, so point a temp dir at the official config and
     # the ComfyUI weights file via symlinks (no copy of the 17.5 GB file).
     tmp = Path(tempfile.mkdtemp(prefix="qwen_te_"))
-    for name in ("config.json", "generation_config.json"):
-        (tmp / name).symlink_to(Path(official_dir) / "text_encoder" / name)
-    (tmp / "model.safetensors").symlink_to(te_path)
+    try:
+        for name in ("config.json", "generation_config.json"):
+            (tmp / name).symlink_to(Path(official_dir) / "text_encoder" / name)
+        (tmp / "model.safetensors").symlink_to(te_path)
 
-    t0 = time.time()
-    text_encoder, info = Qwen3VLForConditionalGeneration.from_pretrained(
-        tmp,
-        # ComfyUI stores the language model as model.layers.* / model.embed_tokens.* / model.norm.*;
-        # transformers expects model.language_model.*. The vision tower (model.visual.*) and lm_head match.
-        key_mapping={r"^model\.(?!visual\.|language_model\.)": "model.language_model."},
-        **loading,
-    )
-    print(f"  loaded in {time.time() - t0:.1f}s")
+        t0 = time.time()
+        text_encoder, info = Qwen3VLForConditionalGeneration.from_pretrained(
+            tmp,
+            # ComfyUI stores the language model as model.layers.* / model.embed_tokens.* / model.norm.*;
+            # transformers expects model.language_model.*. The vision tower (model.visual.*) and lm_head match.
+            key_mapping={r"^model\.(?!visual\.|language_model\.)": "model.language_model."},
+            **loading,
+        )
+        print(f"  loaded in {time.time() - t0:.1f}s")
+    finally:
+        # The weights are on the GPU by now and these are only symlinks, so the shim can go.
+        shutil.rmtree(tmp, ignore_errors=True)
     ok = report_loading_info("text_encoder", info)
     return text_encoder, ok
 
@@ -213,7 +327,9 @@ def build_pipeline(quant="Q8_0", te_quant="8bit", cpu_offload=False, weights="gg
     from transformers import Qwen3VLProcessor
 
     assert torch.cuda.is_available(), "CUDA not available"
-    print(f"GPU: {torch.cuda.get_device_name(0)}, torch {torch.__version__}")
+    free_gib, total_gib = vram_budget()
+    print(f"GPU: {torch.cuda.get_device_name(0)}, {total_gib:.1f} GiB total, {free_gib:.1f} GiB free, "
+          f"torch {torch.__version__}")
     odir = official_dir(weights)
 
     device = "cpu" if cpu_offload else "cuda"
@@ -230,8 +346,10 @@ def build_pipeline(quant="Q8_0", te_quant="8bit", cpu_offload=False, weights="gg
     vram("+ text_encoder")
 
     vae = AutoencoderKLQwenImage21.from_pretrained(odir, subfolder="vae", torch_dtype=torch.bfloat16).to(device)
-    vae.enable_tiling()  # the text encoder stays resident, so full-frame decode above ~768px runs out of VRAM
-    print("vae: official Qwen/Qwen-Image-2.1/vae (tiled decode)")
+    # Tiling stays on as the safe default; generate() reconsiders it per job, once the output size
+    # and the VRAM actually free at that moment are both known.
+    vae.enable_tiling()
+    print("vae: official Qwen/Qwen-Image-2.1/vae")
     vram("+ vae")
 
     processor = Qwen3VLProcessor.from_pretrained(odir, subfolder="processor")
@@ -256,28 +374,78 @@ ASPECT_RATIOS = {
     "9:16": (1536, 2752),
 }
 
+# Widest ratio accepted for sizes outside the table. The widest the skills' templates ask for is
+# 9:2 (4.5), so this leaves room without allowing a size no GPU can render.
+MAX_ASPECT = 8.0
+
 
 def add_model_args(ap):
     """Model options shared by the server and the dry run. Resolve with resolve_model_args()."""
-    ap.add_argument("--weights", default="gguf", choices=WEIGHTS,
-                    help="gguf: abenzerps Uncensored GGUF transformer; original: official Qwen/Qwen-Image-2.1 weights")
+    ap.add_argument("--weights", default=None, choices=WEIGHTS,
+                    help="gguf: abenzerps Uncensored GGUF transformer; original: official Qwen/Qwen-Image-2.1 "
+                         "weights (default: the profile's, else gguf)")
     ap.add_argument("--quant", default=None,
                     help=f"transformer quant. gguf: {', '.join(QUANTS)} (default Q8_0); "
                          f"original: {', '.join(ORIGINAL_QUANTS)} (default 8bit, bitsandbytes)")
     ap.add_argument("--te-quant", default=None, choices=TE_QUANTS,
                     help="text encoder quantization (default: 8bit, or 4bit with --cpu-offload)")
-    ap.add_argument("--cpu-offload", action="store_true",
+    ap.add_argument("--cpu-offload", action="store_true", default=None,
                     help="optional fallback, off by default (everything runs on the GPU): keep components in "
                          "system RAM and move each to the GPU only while it runs (diffusers "
                          "enable_model_cpu_offload). Slower; for edits with several input images or bf16 weights")
 
 
-def resolve_model_args(args):
-    """Fill in --quant / --te-quant defaults that depend on other options."""
-    args.quant = resolve_quant(args.weights, args.quant, args.cpu_offload)
+def read_profile(path=PROFILE_PATH):
+    """The profile setup.sh wrote, or None. A broken file is reported and ignored, never fatal."""
+    import json
+
+    if not path.is_file():
+        return None
+    try:
+        profile = json.loads(path.read_text())
+    except (OSError, ValueError) as e:
+        print(f"warning: ignoring unreadable profile {path} ({type(e).__name__}: {e})")
+        return None
+    if not isinstance(profile, dict):
+        print(f"warning: ignoring profile {path}: expected a JSON object")
+        return None
+    return profile
+
+
+def describe_profile(profile):
+    where = profile.get("chosen_by", "?")
+    gpu = profile.get("gpu")
+    on = f" for {gpu}" if gpu else ""
+    return f"profile: {profile.get('weights')}/{profile.get('quant')}, te {profile.get('te_quant')} ({where}{on})"
+
+
+def resolve_model_args(args, profile_path=PROFILE_PATH):
+    """Settle the model options, in this order of precedence:
+
+    1. what was passed on the command line
+    2. the profile setup.sh wrote (honoured as recorded, even on a different GPU)
+    3. the built-in defaults
+
+    The profile is what makes `uv run qwen_image_server.py` with no flags load whatever
+    setup.sh downloaded, instead of falling back to Q8_0 and asking for a file that is not there.
+    """
+    profile = read_profile(profile_path)
+    if profile:
+        from_profile = [f for f in PROFILE_FIELDS
+                        if getattr(args, f, None) is None and profile.get(f) is not None]
+        for field in from_profile:
+            setattr(args, field, profile[field])
+        if from_profile:
+            print(f"{describe_profile(profile)}; using its {', '.join(from_profile)}")
+
+    if args.weights is None:
+        args.weights = "gguf"
+    if args.cpu_offload is None:
+        args.cpu_offload = False
     if args.te_quant is None:
         args.te_quant = "4bit" if args.cpu_offload else "8bit"
-    elif args.cpu_offload and args.te_quant == "8bit":
+    args.quant = resolve_quant(args.weights, args.quant, args.cpu_offload, args.te_quant)
+    if args.cpu_offload and args.te_quant == "8bit":
         # bitsandbytes leaves the int8 weights (weight.CB, ~7 GiB) on the GPU when an 8-bit model is
         # moved to the CPU, so offloading an 8-bit text encoder frees almost nothing.
         print("warning: --te-quant 8bit does not offload (bitsandbytes keeps ~7 GiB of int8 weights on the GPU); "
@@ -312,6 +480,7 @@ def generate(pipe, prompt, width, height, steps, seed, images=None, cpu_offload=
 
     n_img = f", {len(images)} reference image(s)" if images else ""
     print(f"generating {width}x{height}, {steps} steps, seed {seed}{n_img}")
+    set_vae_tiling(pipe, width, height, cpu_offload)
     torch.cuda.reset_peak_memory_stats()
     t0 = time.time()
     image = pipe(
@@ -352,9 +521,18 @@ def size_for_ratio(ratio):
         rw, rh = (float(x) for x in ratio.split(":"))
     except ValueError:
         raise SystemExit(f"invalid ratio {ratio!r}; expected e.g. 3:2")
+    # Both sides have to be finite and positive, or the arithmetic below raises instead of
+    # reporting a bad request: 0:1 and 1:0 divide by zero, -1:2 takes the root of a negative,
+    # and nan/inf cannot be rounded to an int.
+    if not (math.isfinite(rw) and math.isfinite(rh)) or rw <= 0 or rh <= 0:
+        raise SystemExit(f"invalid ratio {ratio!r}: both sides must be finite and greater than zero")
+    if not 1 / MAX_ASPECT <= rw / rh <= MAX_ASPECT:
+        # Without this, 0.0001:1 asks for 32x131072: a latent far too large for any GPU.
+        raise SystemExit(f"ratio {ratio!r} is more extreme than {MAX_ASPECT:g}:1; "
+                         f"the widest size the model is documented for is 9:2")
     area = 2048 * 2048
-    width = round(math.sqrt(area * rw / rh) / 32) * 32
-    height = round(area / width / 32) * 32
+    width = max(32, round(math.sqrt(area * rw / rh) / 32) * 32)
+    height = max(32, round(area / width / 32) * 32)
     print(f"note: {ratio} is not one of the model card sizes; using {width}x{height}")
     return width, height
 
@@ -364,6 +542,8 @@ def size_following(image):
     import math
 
     ratio = image.width / image.height
-    width = round(math.sqrt(2048 * 2048 * ratio) / 32) * 32
-    height = round(width / ratio / 32) * 32
+    # A pathologically thin input would otherwise produce a latent too large to render.
+    ratio = min(MAX_ASPECT, max(1 / MAX_ASPECT, ratio))
+    width = max(32, round(math.sqrt(2048 * 2048 * ratio) / 32) * 32)
+    height = max(32, round(width / ratio / 32) * 32)
     return width, height
